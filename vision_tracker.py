@@ -4,8 +4,8 @@
 ║           Powered by MediaPipe Tasks API & OpenCV               ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-Author  : <Your Name>
-GitHub  : https://github.com/<your-username>
+Author  : <Murat Can Nergiz>
+GitHub  : https://github.com/<codcreater1>
 License : MIT
 
 Features:
