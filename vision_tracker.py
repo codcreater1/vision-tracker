@@ -12,7 +12,10 @@ Features:
   ✦ 478-point Face Mesh (iris landmarks included)
   ✦ Dual hand tracking with 21 landmarks per hand
   ✦ Real-time FPS counter
-  ✦ Live finger gesture recognition (peace, fist, thumbs-up, open hand)
+  ✦ Live finger gesture recognition (peace, fist, thumbs-up, open hand,
+    OK sign, rock on)
+  ✦ Hold-to-trigger actions: hold OK Sign for 1.2s to auto-capture a
+    screenshot (per-hand progress bar shown in the HUD)
   ✦ Blink detection via Eye Aspect Ratio (EAR)
   ✦ On-screen HUD with landmark counts
   ✦ Screenshot capture (press S)
@@ -75,6 +78,11 @@ class Config:
 
     # Screenshot output folder
     SCREENSHOT_DIR      = "screenshots"
+
+    # Gesture recognition — pinch / hold-to-trigger
+    OK_PINCH_PX          = 40     # thumb-tip↔index-tip distance (px) that counts as an "OK" pinch
+    GESTURE_HOLD_SECONDS = 1.2    # how long a gesture must be held to fire its action
+    GESTURE_COOLDOWN     = 2.0    # min seconds between auto-triggered actions
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -190,11 +198,21 @@ def fingers_up(landmarks, w: int, h: int) -> list[bool]:
     return up
 
 
-def classify_gesture(up: list[bool]) -> str:
-    """Map finger states to a named gesture."""
+def is_ok_pinch(landmarks, w: int, h: int, threshold_px: int) -> bool:
+    """True when thumb-tip and index-tip are close enough to form an 'OK' circle."""
+    pts = [to_pixel(lm, w, h) for lm in landmarks]
+    return distance(pts[FINGERTIPS[0]], pts[FINGERTIPS[1]]) < threshold_px
+
+
+def classify_gesture(up: list[bool], pinch: bool = False) -> str:
+    """Map finger states (+ optional thumb/index pinch) to a named gesture."""
     thumb, index, middle, ring, pinky = up
     total = sum(up)
 
+    if pinch and middle and ring and pinky:
+        return "👌  OK Sign"
+    if index and pinky and not middle and not ring:
+        return "🤟  Rock On"
     if total == 0:
         return "✊  Fist"
     if total == 5:
@@ -314,9 +332,19 @@ def draw_hud(frame, fps: float, face_count: int, hand_data: list,
 
     # Hands
     put(f"Hands    {len(hand_data)}", y0 + 4 * dy)
-    for i, (side, gesture) in enumerate(hand_data):
+    for i, (side, gesture, hold_ratio) in enumerate(hand_data):
         color = cfg.HAND_R_DOT if side == "Right" else cfg.HAND_L_DOT
-        put(f"  {side[:1]}: {gesture}", y0 + (5 + i) * dy, color, scale=0.46)
+        row_y = y0 + (5 + i) * dy
+        put(f"  {side[:1]}: {gesture}", row_y, color, scale=0.46)
+        if hold_ratio > 0:
+            bar_x, bar_w, bar_y = pad + 150, 70, row_y - 8
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 6),
+                          cfg.TEXT_DIM, 1, cv2.LINE_AA)
+            fill_w = int(bar_w * hold_ratio)
+            fill_c = (0, 220, 80) if hold_ratio >= 1.0 else cfg.HUD_ACCENT
+            if fill_w > 0:
+                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + 6),
+                              fill_c, -1, cv2.LINE_AA)
 
     # Settings row
     y_settings = 8 + panel_h - 14
@@ -407,6 +435,8 @@ def main() -> None:
     fps_times       = deque(maxlen=cfg.FPS_WINDOW)
     overlay_alpha   = 0.85   # mesh overlay opacity
     mirror          = True   # flip frame horizontally
+    gesture_hold    = {}     # side -> {"gesture": str, "start": float}
+    last_action_ts  = 0.0    # perf_counter of last auto-triggered action
 
     print("=" * 60)
     print("  Real-Time Vision Tracker — running")
@@ -452,16 +482,44 @@ def main() -> None:
                 pass
 
         # ── Draw HANDS ─────────────────────────────────────────
+        now = time.perf_counter()
+        active_sides = set()
         hand_data = []
         for i, hand_lms in enumerate(hand_result.hand_landmarks):
             side    = hand_result.handedness[i][0].category_name  # "Left"/"Right"
             up      = fingers_up(hand_lms, w, h)
-            gesture = classify_gesture(up)
-            hand_data.append((side, gesture))
+            pinch   = is_ok_pinch(hand_lms, w, h, cfg.OK_PINCH_PX)
+            gesture = classify_gesture(up, pinch)
+            active_sides.add(side)
+
+            # ── Gesture hold tracking (per hand) ────────────────
+            prev = gesture_hold.get(side)
+            if prev and prev["gesture"] == gesture:
+                held = now - prev["start"]
+            else:
+                gesture_hold[side] = {"gesture": gesture, "start": now}
+                held = 0.0
+            hold_ratio = min(1.0, held / cfg.GESTURE_HOLD_SECONDS)
+
+            # ── Hold-to-trigger: OK Sign → auto screenshot ──────
+            if ("OK Sign" in gesture and held >= cfg.GESTURE_HOLD_SECONDS
+                    and (now - last_action_ts) > cfg.GESTURE_COOLDOWN):
+                ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+                path = os.path.join(cfg.SCREENSHOT_DIR, f"okgesture_{ts}.png")
+                cv2.imwrite(path, frame)
+                last_action_ts = now
+                print(f"[👌] OK Sign held {cfg.GESTURE_HOLD_SECONDS}s — auto screenshot: {path}")
+
+            hand_data.append((side, gesture, hold_ratio))
 
             dot_c  = cfg.HAND_R_DOT  if side == "Right" else cfg.HAND_L_DOT
             line_c = cfg.HAND_R_LINE if side == "Right" else cfg.HAND_L_LINE
             draw_hand(canvas, hand_lms, dot_c, line_c, w, h)
+
+        # Drop hold-state for hands that left the frame
+        for side in list(gesture_hold.keys()):
+            if side not in active_sides:
+                del gesture_hold[side]
 
         # ── Blend overlay onto frame ────────────────────────────
         frame = blend_overlay(canvas, frame, overlay_alpha)
