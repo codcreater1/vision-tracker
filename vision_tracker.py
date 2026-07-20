@@ -16,6 +16,9 @@ Features:
     OK sign, rock on)
   ✦ Hold-to-trigger actions: hold OK Sign for 1.2s to auto-capture a
     screenshot (per-hand progress bar shown in the HUD)
+  ✦ Pinch-to-zoom: thumb-index distance drives live digital zoom
+  ✦ Swipe detection: fast open-hand left/right motion fires a
+    next/prev slide action
   ✦ Blink detection via Eye Aspect Ratio (EAR)
   ✦ On-screen HUD with landmark counts
   ✦ Screenshot capture (press S)
@@ -83,6 +86,19 @@ class Config:
     OK_PINCH_PX          = 40     # thumb-tip↔index-tip distance (px) that counts as an "OK" pinch
     GESTURE_HOLD_SECONDS = 1.2    # how long a gesture must be held to fire its action
     GESTURE_COOLDOWN     = 2.0    # min seconds between auto-triggered actions
+
+    # Pinch-to-zoom (thumb-index distance, normalized by hand size)
+    PINCH_ZOOM_MIN_RATIO = 0.25   # fully pinched  -> zoom = ZOOM_MIN
+    PINCH_ZOOM_MAX_RATIO = 1.4    # fully spread   -> zoom = ZOOM_MAX
+    ZOOM_MIN             = 1.0
+    ZOOM_MAX             = 2.5
+    ZOOM_SMOOTHING       = 0.25   # 0..1, higher = snappier
+
+    # Swipe detection (wrist horizontal motion)
+    SWIPE_HISTORY_SEC    = 0.5    # window used to measure swipe velocity
+    SWIPE_MIN_DIST_RATIO = 0.18   # min horizontal travel (fraction of frame width)
+    SWIPE_COOLDOWN       = 0.8    # min seconds between swipe triggers
+    SWIPE_DISPLAY_SEC    = 1.0    # how long the swipe label stays on HUD
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -175,6 +191,81 @@ def blend_overlay(frame, overlay, alpha: float) -> np.ndarray:
     return cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
 
 
+def apply_digital_zoom(frame: np.ndarray, zoom: float) -> np.ndarray:
+    """Crop the center of the frame and resize back up = digital zoom."""
+    if zoom <= 1.0:
+        return frame
+    h, w = frame.shape[:2]
+    new_w, new_h = int(w / zoom), int(h / zoom)
+    x0 = (w - new_w) // 2
+    y0 = (h - new_h) // 2
+    cropped = frame[y0:y0 + new_h, x0:x0 + new_w]
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+# ═══════════════════════════════════════════════════════════════
+# PINCH-TO-ZOOM
+# ═══════════════════════════════════════════════════════════════
+
+def pinch_zoom_factor(landmarks, w: int, h: int, cfg: Config) -> float:
+    """
+    Map thumb-tip↔index-tip distance (normalized by palm size, so it
+    works at any distance from the camera) to a target zoom level.
+    """
+    pts = [to_pixel(lm, w, h) for lm in landmarks]
+    pinch_dist = distance(pts[FINGERTIPS[0]], pts[FINGERTIPS[1]])
+    palm_size  = distance(pts[0], pts[9]) + 1e-6   # wrist -> middle_mcp
+    ratio = pinch_dist / palm_size
+
+    ratio = max(cfg.PINCH_ZOOM_MIN_RATIO,
+                min(cfg.PINCH_ZOOM_MAX_RATIO, ratio))
+    t = (ratio - cfg.PINCH_ZOOM_MIN_RATIO) / (
+        cfg.PINCH_ZOOM_MAX_RATIO - cfg.PINCH_ZOOM_MIN_RATIO)
+    return cfg.ZOOM_MIN + t * (cfg.ZOOM_MAX - cfg.ZOOM_MIN)
+
+
+# ═══════════════════════════════════════════════════════════════
+# SWIPE DETECTION
+# ═══════════════════════════════════════════════════════════════
+
+class SwipeTracker:
+    """Tracks wrist x-position over a short time window per hand side
+    and reports a 'Left'/'Right' swipe once travel/velocity thresholds
+    are crossed."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.history = {}       # side -> deque[(t, x_norm)]
+        self.last_trigger = 0.0
+
+    def update(self, side: str, wrist_x_norm: float, now: float):
+        hist = self.history.setdefault(side, deque())
+        hist.append((now, wrist_x_norm))
+        while hist and now - hist[0][0] > self.cfg.SWIPE_HISTORY_SEC:
+            hist.popleft()
+
+    def detect(self, now: float) -> str | None:
+        """Returns 'Left', 'Right', or None. Fires at most once per cooldown."""
+        if now - self.last_trigger < self.cfg.SWIPE_COOLDOWN:
+            return None
+        for side, hist in self.history.items():
+            if len(hist) < 2:
+                continue
+            t0, x0 = hist[0]
+            t1, x1 = hist[-1]
+            travel = x1 - x0
+            if abs(travel) >= self.cfg.SWIPE_MIN_DIST_RATIO:
+                self.last_trigger = now
+                hist.clear()
+                return "Right" if travel > 0 else "Left"
+        return None
+
+    def drop_missing(self, active_sides: set) -> None:
+        for side in list(self.history.keys()):
+            if side not in active_sides:
+                del self.history[side]
+
+
 # ═══════════════════════════════════════════════════════════════
 # GESTURE RECOGNITION
 # ═══════════════════════════════════════════════════════════════
@@ -196,6 +287,13 @@ def fingers_up(landmarks, w: int, h: int) -> list[bool]:
     for tip_idx, pip_idx in zip(FINGERTIPS[1:], FINGER_PIPS[1:]):
         up.append(pts[tip_idx][1] < pts[pip_idx][1])
     return up
+
+
+def middle_ring_pinky_up(up: list[bool]) -> bool:
+    """True if middle/ring/pinky are extended (used to keep OK-sign gesture
+    and plain pinch-to-zoom from overlapping)."""
+    _, _, middle, ring, pinky = up
+    return middle and ring and pinky
 
 
 def is_ok_pinch(landmarks, w: int, h: int, threshold_px: int) -> bool:
@@ -352,6 +450,31 @@ def draw_hud(frame, fps: float, face_count: int, hand_data: list,
     put(settings, y_settings, cfg.TEXT_DIM, scale=0.40)
 
 
+def draw_zoom_swipe_hud(frame, zoom: float, swipe_label: str, w_frame: int, cfg: Config) -> None:
+    """Top-right indicator for pinch-zoom level and last swipe action."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    box_w = 190
+    x0 = w_frame - box_w - 8
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, 8), (x0 + box_w, 66), cfg.HUD_BG, -1)
+    cv2.rectangle(overlay, (x0, 8), (x0 + box_w, 66), cfg.HUD_ACCENT, 1)
+    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+
+    cv2.putText(frame, f"Zoom: {zoom:.2f}x", (x0 + 10, 30), font, 0.5,
+                cfg.TEXT_PRIMARY, 1, cv2.LINE_AA)
+
+    bar_x, bar_y, bar_w = x0 + 10, 38, box_w - 20
+    fill = int(bar_w * (zoom - cfg.ZOOM_MIN) / (cfg.ZOOM_MAX - cfg.ZOOM_MIN + 1e-6))
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 6), cfg.TEXT_DIM, 1, cv2.LINE_AA)
+    if fill > 0:
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill, bar_y + 6), cfg.HUD_ACCENT, -1, cv2.LINE_AA)
+
+    swipe_text = f"Swipe: {swipe_label}" if swipe_label else "Swipe: —"
+    cv2.putText(frame, swipe_text, (x0 + 10, 58), font, 0.5,
+                cfg.HUD_ACCENT if swipe_label else cfg.TEXT_DIM, 1, cv2.LINE_AA)
+
+
 def draw_keybinds(frame, cfg: Config) -> None:
     """Render key-binding cheatsheet in the bottom-left corner."""
     keys = [
@@ -438,6 +561,11 @@ def main() -> None:
     gesture_hold    = {}     # side -> {"gesture": str, "start": float}
     last_action_ts  = 0.0    # perf_counter of last auto-triggered action
 
+    zoom_current    = cfg.ZOOM_MIN   # smoothed digital zoom level
+    swipe_tracker   = SwipeTracker(cfg)
+    swipe_label     = ""
+    swipe_label_ts  = 0.0
+
     print("=" * 60)
     print("  Real-Time Vision Tracker — running")
     print("  Press Q to quit, S to screenshot, M to mirror")
@@ -512,6 +640,16 @@ def main() -> None:
 
             hand_data.append((side, gesture, hold_ratio))
 
+            # ── Pinch-to-zoom: thumb+index apart, other 3 fingers curled ──
+            if not middle_ring_pinky_up(up):
+                zoom_target = pinch_zoom_factor(hand_lms, w, h, cfg)
+                zoom_current += (zoom_target - zoom_current) * cfg.ZOOM_SMOOTHING
+
+            # ── Swipe: open hand moving fast left/right ────────────────
+            if gesture.strip().endswith("Open Hand"):
+                wrist_x_norm = hand_lms[0].x  # already mirrored if mirror=True
+                swipe_tracker.update(side, wrist_x_norm, now)
+
             dot_c  = cfg.HAND_R_DOT  if side == "Right" else cfg.HAND_L_DOT
             line_c = cfg.HAND_R_LINE if side == "Right" else cfg.HAND_L_LINE
             draw_hand(canvas, hand_lms, dot_c, line_c, w, h)
@@ -520,9 +658,22 @@ def main() -> None:
         for side in list(gesture_hold.keys()):
             if side not in active_sides:
                 del gesture_hold[side]
+        swipe_tracker.drop_missing(active_sides)
+
+        # ── Resolve swipe trigger ────────────────────────────────────
+        detected_swipe = swipe_tracker.detect(now)
+        if detected_swipe:
+            swipe_label = detected_swipe
+            swipe_label_ts = now
+            print(f"[↔] Swipe {detected_swipe} detected — next/prev slide action")
+        if swipe_label and (now - swipe_label_ts) > cfg.SWIPE_DISPLAY_SEC:
+            swipe_label = ""
 
         # ── Blend overlay onto frame ────────────────────────────
         frame = blend_overlay(canvas, frame, overlay_alpha)
+
+        # ── Apply pinch-controlled digital zoom ─────────────────
+        frame = apply_digital_zoom(frame, zoom_current)
 
         # ── FPS calculation ────────────────────────────────────
         fps_times.append(time.perf_counter())
@@ -536,6 +687,7 @@ def main() -> None:
                  hand_data, blink_left, blink_right,
                  overlay_alpha, mirror, cfg)
         draw_keybinds(frame, cfg)
+        draw_zoom_swipe_hud(frame, zoom_current, swipe_label, w, cfg)
 
         # ── Display ────────────────────────────────────────────
         cv2.imshow("Vision Tracker — MediaPipe", frame)
